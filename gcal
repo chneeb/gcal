@@ -1,0 +1,142 @@
+#!/usr/bin/ruby -W0
+
+require 'date'
+require 'net/https'
+require 'rexml/document'
+
+module Google
+  class Calendar
+    def initialize(cl_string)
+      @cl_string = cl_string
+    end
+
+    def request(method, params=nil, data=nil)
+      http = Net::HTTP.new('www.google.com', 80)
+      http.use_ssl = false
+      path = "/calendar/feeds/default/private/full"
+      headers = {
+        "Content-Type" => "application/atom+xml",
+        "Authorization" => "GoogleLogin auth=#{@cl_string}",
+        "GData-Version" => "2"
+      }
+      response = case(method)
+                 when :post
+                   http.post(path, data, headers)
+                 when :get
+                   http.get(path + params, headers)
+                 end
+      if response.code == "302"
+        response.body =~ /gsessionid=(.*)"/
+        gsessionid = $1
+        response = case(method)
+                   when :post
+                     http.post(path + "?gsessionid=#{gsessionid}",
+                               data, headers)
+                   when :get
+                     http.get(path + "#{params}&gsessionid=#{gsessionid}",
+                              headers)
+                   end
+      end
+      response
+    end
+
+    def quick_add(event)
+      data = <<EOT
+<entry xmlns='http://www.w3.org/2005/Atom' xmlns:gCal='http://schemas.google.com/gCal/2005'>
+  <content type="html">#{event}</content>
+  <gCal:quickadd value="true"/>
+</entry>
+EOT
+      request(:post, nil, data)
+    end
+
+    def retrieve_events(start_min, start_max)
+      events = []
+      params = "?start-min=#{start_min}&start-max=#{start_max}"
+      response = request(:get, params, nil)
+      xml = response.body
+      doc = REXML::Document.new(xml)
+      root = doc.root
+      root.each_element('//entry') do |element|
+        events << {
+          :title => element.elements['title'].text,
+          :start_time => element.elements['gd:when'].attributes['startTime'],
+          :end_time => element.elements['gd:when'].attributes['endTime']
+        }
+      end
+      events.sort{|a,b| a[:start_time] <=> b[:start_time]}
+    end
+
+    # TODO: Integrate with TZInfo for timezone support
+    # FIXME: It's hard-coded to New York timezone
+    def retrieve_events_from_date_to_date(from_date, to_date)
+      start_min = "#{from_date.to_s}T00:00:00-05:00"
+      start_max = "#{to_date.to_s}T23:59:59-05:00"
+      events = retrieve_events(start_min, start_max)
+    end
+
+    def retrieve_events_for_date(date=Date.today)
+      retrieve_events_from_date_to_date(date, date)
+    end
+  end
+
+  def self.authenticate(email, password)
+    http = Net::HTTP.new('www.google.com', 443)
+    http.use_ssl = true
+    path = '/accounts/ClientLogin'
+    data = "accountType=HOSTED_OR_GOOGLE&Email=#{email}" +
+      "&Passwd=#{password}" +
+      "&service=cl" +
+      "&source=chneeb-ruby-gcal-quick-add-1"
+    headers = {'Content-Type' => 'application/x-www-form-urlencoded'}
+    response = http.post(path, data, headers)
+    cl_string = response.body[/Auth=(.*)/, 1]
+  end
+end
+
+def keychain_access(server)
+  security_result = %x{security find-internet-password -gs #{server} 2>&1}
+  password_line, account_line = security_result.split(/\n/).values_at(0,6)
+  account = account_line.match(/^\s+"acct"<blob>="(.*)"/).captures.first
+  password = password_line.match(/^password: "(.*)"$/).captures.first
+  return account, password
+end
+
+def parse_date(str)
+  Date.parse(str)
+rescue ArgumentError => e
+  nil
+end
+
+def event_to_diary_format(event)
+  start_time = DateTime.parse(event[:start_time])
+  start_time.strftime('%m/%d/%Y %I:%M%p') + "\t" + event[:title]
+end
+
+username, password = keychain_access("www.google.com")
+cl_string = Google.authenticate(username, password)
+args = ARGV.join(" ")
+calendar = Google::Calendar.new(cl_string)
+events = []
+
+if args.empty?
+  events = calendar.retrieve_events_for_date(Date.today)
+elsif args =~ /^(\+|\-)([0-9]+)((\+|\-)([0-9]+))?/
+  today = Date.today
+  days = ["#{$1}#{$2}", "#{$4}#{$5}"]
+  days_before = days.reject{|day| day =~ /^\+/}.first
+  days_after = days.reject{|day| day =~ /^\-/}.first
+  from_date = eval("today#{days_before}")
+  to_date = eval("today#{days_after}")
+  events = calendar.retrieve_events_from_date_to_date(from_date, to_date)
+elsif args =~ /^[0-9]/ and (date = parse_date(args))
+  events = calendar.retrieve_events_for_date(date)
+else
+  event = args
+  calendar.quick_add(event)
+end
+
+puts
+events.each do |event|
+  puts event_to_diary_format(event)
+end
